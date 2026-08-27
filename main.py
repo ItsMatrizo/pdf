@@ -3,7 +3,8 @@ import io
 import logging
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
-import fitz  # PyMuPDF
+import pypdfium2 as pdfium
+from pypdf import PdfReader
 
 # Setup logging
 logging.basicConfig(
@@ -19,7 +20,6 @@ ALLOWED_USER_ID = 7747769628
 user_pdf_data = {}
 
 async def check_user(update: Update) -> bool:
-    """Returns True if the user is allowed, otherwise replies and returns False."""
     if update.effective_user.id != ALLOWED_USER_ID:
         await update.message.reply_text("⛔ Unauthorized. This bot is private.")
         return False
@@ -49,16 +49,14 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ Processing PDF...")
 
     try:
-        # Download file as bytes
         file = await context.bot.get_file(document.file_id)
         file_bytes = await file.download_as_bytearray()
 
-        # Open PDF with PyMuPDF to get page count
-        pdf_document = fitz.open(stream=file_bytes, filetype="pdf")
-        total_pages = pdf_document.page_count
-        pdf_document.close()
+        # Get page count using pypdf (fast, pure Python)
+        reader = PdfReader(io.BytesIO(file_bytes))
+        total_pages = len(reader.pages)
 
-        # Store the bytes and page count for later use
+        # Store for later use
         user_id = update.effective_user.id
         user_pdf_data[user_id] = {
             "bytes": file_bytes,
@@ -67,23 +65,27 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_text(f"📄 Total pages: **{total_pages}**")
 
-        # Send first 5 pages (or fewer)
+        # Convert first 5 pages to images (or fewer)
         pages_to_send = min(5, total_pages)
         if pages_to_send == 0:
             await update.message.reply_text("This PDF has no pages.")
             return
 
-        # Re‑open the PDF from stored bytes
-        pdf_document = fitz.open(stream=file_bytes, filetype="pdf")
+        # Render with pypdfium2
+        pdf = pdfium.PdfDocument(io.BytesIO(file_bytes))
         for page_num in range(pages_to_send):
-            page = pdf_document.load_page(page_num)
-            pix = page.get_pixmap(dpi=150)
-            img_bytes = pix.tobytes("png")
+            page = pdf.get_page(page_num)
+            # Render at 150 DPI
+            bitmap = page.render(scale=150/72)  # 72 is default DPI, so 150/72 = 2.0833
+            pil_image = bitmap.to_pil()
+            img_bytes = io.BytesIO()
+            pil_image.save(img_bytes, format="PNG")
+            img_bytes.seek(0)
             await update.message.reply_photo(
-                photo=io.BytesIO(img_bytes),
+                photo=img_bytes,
                 caption=f"Page {page_num + 1} / {total_pages}"
             )
-        pdf_document.close()
+        pdf.close()
 
         if total_pages > 5:
             await update.message.reply_text(
@@ -106,7 +108,6 @@ async def pages_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ No PDF stored. Please send a PDF first.")
         return
 
-    # Parse arguments: /pages start end
     args = context.args
     if len(args) != 2:
         await update.message.reply_text("Usage: /pages <start> <end>\nExample: /pages 3 7")
@@ -120,7 +121,6 @@ async def pages_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     total_pages = user_pdf_data[user_id]["total_pages"]
-    # Convert to 0‑based and clamp to valid range
     if start < 1 or end > total_pages or start > end:
         await update.message.reply_text(
             f"Invalid range. Pages are 1‑{total_pages} and start ≤ end."
@@ -129,16 +129,19 @@ async def pages_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         pdf_bytes = user_pdf_data[user_id]["bytes"]
-        pdf_document = fitz.open(stream=pdf_bytes, filetype="pdf")
-        for page_num in range(start - 1, end):  # 0‑based
-            page = pdf_document.load_page(page_num)
-            pix = page.get_pixmap(dpi=150)
-            img_bytes = pix.tobytes("png")
+        pdf = pdfium.PdfDocument(io.BytesIO(pdf_bytes))
+        for page_num in range(start - 1, end):
+            page = pdf.get_page(page_num)
+            bitmap = page.render(scale=150/72)
+            pil_image = bitmap.to_pil()
+            img_bytes = io.BytesIO()
+            pil_image.save(img_bytes, format="PNG")
+            img_bytes.seek(0)
             await update.message.reply_photo(
-                photo=io.BytesIO(img_bytes),
+                photo=img_bytes,
                 caption=f"Page {page_num + 1} / {total_pages}"
             )
-        pdf_document.close()
+        pdf.close()
     except Exception as e:
         logger.error(f"Pages command error: {e}")
         await update.message.reply_text("❌ Error extracting pages. Please try again.")
@@ -161,15 +164,11 @@ def main():
 
     app = Application.builder().token(token).build()
 
-    # Command handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("pages", pages_command))
     app.add_handler(CommandHandler("done", done_command))
-
-    # PDF document handler
     app.add_handler(MessageHandler(filters.Document.ALL, handle_pdf))
 
-    # Start polling (keeps the bot alive)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
